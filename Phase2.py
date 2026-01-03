@@ -1,11 +1,10 @@
 """
 CATAMARAN BLDC BOAT CONTROLLER
-Complete and tested version
-
-3 modes:
+4 modes:
 1. PS4 Advanced (R2=speed, left stick=differential control)
 2. AI Simple + R2 Speed + Stick Differential
 3. AI Smart Search + R2 Speed + Stick Differential
+4. Timed Navigation (Toggle MANUAL ↔ AUTO)
 """
 
 import time
@@ -13,44 +12,38 @@ import board
 import pygame
 import cv2
 import numpy as np
-import busio # I2C communication
-from adafruit_pca9685 import PCA9685 # Control ESCs through PCA9685 PWM driver
+import busio
+from adafruit_pca9685 import PCA9685
 from ultralytics import YOLO
 
 # ====== MOTOR CONFIGURATION ======
-# PCA9685 Freq, ESCs usually use 50Hz
-FREQUENCY = 50 # Hz
+FREQUENCY = 50
 
-# PCA9685 PWM Channels
 MOTOR_L_CHANNEL = 0 
 MOTOR_R_CHANNEL = 1
-# Servo : SG-5010 
-SERVO1_CHANNEL = 2
-
+SERVO1_CHANNEL = 3
 
 # DISCOVERED VALUES 
-# Microsecond pulse values for ESC control
-MOTOR_L_MIN = 3900 # Minimum throttle
-MOTOR_L_MAX = 5500 # Maximum throttle
-
+MOTOR_L_MIN = 3900
+MOTOR_L_MAX = 5500
 MOTOR_R_MIN = 3900
 MOTOR_R_MAX = 5500
 
-SERVO1_MIN = 1800   # Right position
-SERVO1_CENTER = 4000  # Center
-SERVO1_MAX = 8400   # Left position
+SERVO1_MIN = 1800
+SERVO1_CENTER = 4000
+SERVO1_MAX = 8400
 
 # SAFETY LIMIT
 MOTOR_SAFE_MAX = 4900
 
-# START LIMIT (for initial testing)
-INITIAL_MAX_SPEED = 80
+# START LIMIT
+INITIAL_MAX_SPEED = 65 # % Changed with each test
 
 # ====== NAVIGATION SPEEDS ======
-FORWARD_SPEED = 60  # %
-TURN_SPEED = 0     # %
+FORWARD_SPEED = 40  # %
+TURN_SPEED = 30     # % 
 
-# Motor trim for balancing
+# Motor trim
 MOTOR_L_TRIM = 1.0
 MOTOR_R_TRIM = 1.0
 
@@ -59,39 +52,38 @@ DEADZONE = 0.15
 R2_SENSITIVITY = 1.3
 
 # ====== AI PARAMETERS ======
-MODEL = "best.pt"  # YOLO model path
-AI_APPROACH_SPEED = 40          
-AI_CLOSE_APPROACH_SPEED = 30    
-AI_CENTERING_THRESHOLD = 0.05
+MODEL = "best7.pt"
+AI_APPROACH_SPEED = 30          
+AI_CLOSE_APPROACH_SPEED = 20   
+AI_CENTERING_THRESHOLD = 0.25
 AI_CLOSE_DISTANCE = 0.4
-AI_CONFIDENCE_THRESHOLD = 0.55
+AI_CONFIDENCE_THRESHOLD = 0.8
 BOTTLE_CLASS_ID = 0
-BOTTLE_CLASS_ID1 = 1
 
 # ====== PID PARAMETERS ======
-KP = 1     # 0.3    
-KI = 0.01  # 0.005  
-KD = 0.2   # 0.15   
+KP = 0.5 # 0.3
+KI = 0.007 # 0.005
+KD = 0.5 # 0.15
 
-# ====== SEARCH PARAMETERS ======                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
-LOOK_TURN_SPEED = 30           
-LOOK_TURN_FRAMES_45 =  25
-LOOK_WAIT_FRAMES = 80
+# ====== SEARCH PARAMETERS ======
+LOOK_TURN_SPEED = 30
+LOOK_TURN_FRAMES_45 = 25
+LOOK_WAIT_FRAMES = 40
 SEARCH_SPIN_SPEED = 40
 
 # ====== SMOOTHING ======
-ACCELERATION_RATE = 2.0  # Max % change per frame
-DECELERATION_RATE = 3.0  # Faster deceleration for safety
+ACCELERATION_RATE = 2.3
+DECELERATION_RATE = 4.0
 
 # Smooth speed tracking
 current_l_speed = 0.0
 current_r_speed = 0.0
 
 # ====== DISPLAY ======
-SHOW_CAMERA = False  # Set False for SSH
+SHOW_CAMERA = True  # False for SSH
 
 print("=" * 70)
-print(" CATAMARAN BLDC CONTROLLER - FIXED VERSION")
+print(" CATAMARAN BLDC BOAT CONTROLLER ")
 print("=" * 70)
 
 # Globals
@@ -102,6 +94,7 @@ ai_enabled = False
 pid_integral = 0
 pid_last_error = 0
 frames_without_target = 0
+nav_mode = "MANUAL"  
 
 # ====== SETUP FUNCTIONS ======
 def setup_pca():
@@ -149,7 +142,6 @@ def init_ps4():
     pygame.init()
     pygame.joystick.init()
     
-    # Retry detection (sometimes pygame needs time to find joystick)
     for attempt in range(3):
         if pygame.joystick.get_count() > 0:
             joy = pygame.joystick.Joystick(0)
@@ -162,17 +154,14 @@ def init_ps4():
             time.sleep(0.5)
     
     print("✗ No PS4 controller detected")
-    print("  Make sure: jstest /dev/input/js0 works first")
-    print("  Then restart this script\n")
     return None
 
 # ====== MOTOR CONTROLLER ======
 class MotorController:
-    def __init__(self): # SET PCA9685 CHANNELS
+    def __init__(self):
         self.l_ch = pca.channels[MOTOR_L_CHANNEL]
         self.r_ch = pca.channels[MOTOR_R_CHANNEL]
         
-        # Calculate safe percentages
         self.l_safe_pct = ((MOTOR_SAFE_MAX - MOTOR_L_MIN) / (MOTOR_L_MAX - MOTOR_L_MIN)) * 100
         self.r_safe_pct = ((MOTOR_SAFE_MAX - MOTOR_R_MIN) / (MOTOR_R_MAX - MOTOR_R_MIN)) * 100
         
@@ -182,28 +171,22 @@ class MotorController:
         print(f"  Initial speed limit: {INITIAL_MAX_SPEED}%\n")
     
     def percent_to_pulse(self, pct_l, pct_r):
-        # Apply trim
         pct_l *= MOTOR_L_TRIM
         pct_r *= MOTOR_R_TRIM
         
-        # Apply safety limits
         pct_l = max(0, min(self.l_safe_pct, pct_l))
         pct_r = max(0, min(self.r_safe_pct, pct_r))
         
-        # Linear mapping: % → µs
         pulse_l = MOTOR_L_MIN + (MOTOR_L_MAX - MOTOR_L_MIN) * pct_l / 100
         pulse_r = MOTOR_R_MIN + (MOTOR_R_MAX - MOTOR_R_MIN) * pct_r / 100
         
-        # Hard clamp
         pulse_l = min(MOTOR_SAFE_MAX, int(pulse_l))
         pulse_r = min(MOTOR_SAFE_MAX, int(pulse_r))
         
         return pulse_l, pulse_r
     
-    def set_motors_percent(self, pct_l, pct_r): 
-        # Convert % to pulse, then set
+    def set_motors_percent(self, pct_l, pct_r):
         pulse_l, pulse_r = self.percent_to_pulse(pct_l, pct_r)
-        # Set duty cycle directly (0-65535 represents 0-20ms)
         self.l_ch.duty_cycle = pulse_l
         self.r_ch.duty_cycle = pulse_r
         return pulse_l, pulse_r
@@ -211,7 +194,6 @@ class MotorController:
     def set_motors_pulse(self, pulse_l, pulse_r):
         pulse_l = max(MOTOR_L_MIN, min(MOTOR_SAFE_MAX, int(pulse_l)))
         pulse_r = max(MOTOR_R_MIN, min(MOTOR_SAFE_MAX, int(pulse_r)))
-        # Set duty cycle directly
         self.l_ch.duty_cycle = pulse_l
         self.r_ch.duty_cycle = pulse_r
         return pulse_l, pulse_r
@@ -220,7 +202,6 @@ class MotorController:
         print("\n  Arming ESCs...")
         print("   Setting minimum throttle...")
         
-        # Set to minimum pulse directly
         self.l_ch.duty_cycle = MOTOR_L_MIN
         self.r_ch.duty_cycle = MOTOR_R_MIN
         
@@ -270,19 +251,15 @@ class ServoController:
         return int(pulse)
     
     def open_net(self):
-        # Center 
         self.set_servo1_percent(50)
     
     def close_net(self):
-        # Closed
         self.set_servo1_percent(0)
     
     def stop(self):
-        # Stop PWM signal to servo
         self.servo1.duty_cycle = 0
     
     def cleanup(self):
-        # Safe cleanup
         print("\n Cleaning up servo...")
         self.stop()
         time.sleep(0.5)
@@ -295,30 +272,70 @@ def apply_deadzone(val, dz=DEADZONE):
     scaled = (abs(val) - dz) / (1.0 - dz)
     return sign * scaled
 
-def smooth_speed_change(current, target, accel_rate, decel_rate):
-    # Smooth acceleration/deceleration
+def smooth_speed_change(current, target, accel_rate=ACCELERATION_RATE, decel_rate=DECELERATION_RATE):
     diff = target - current
     
     if abs(diff) < 0.5:
         return target
     
     if diff > 0:
-        # Accelerating
         return current + min(accel_rate, diff)
     else:
-        # Decelerating
         return current + max(-decel_rate, diff)
 
 def smooth_turn(base_speed, turn_amt):
-    # Reduce one motor speed for turning (no increase for safety)
-    if turn_amt > 0:  # Turn right, reduce right motor
+    if turn_amt > 0:
         l_speed = base_speed
         r_speed = base_speed * (1 - abs(turn_amt) * 0.7)  
-    else:  # Turn left, reduce left motor
+    else:
         l_speed = base_speed * (1 - abs(turn_amt) * 0.7)
         r_speed = base_speed
     
     return l_speed, r_speed
+
+# ====== NAVIGATION OVERLAY ======
+def draw_camera_overlay(frame, mode, action="", speed_l=0, speed_r=0, time_info=""):
+    h, w = frame.shape[:2]
+    
+    # Semi-transparent overlay
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 80), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    
+    # Mode indicator
+    mode_color = (0, 255, 0) if mode == "AUTO" else (255, 255, 0)
+    cv2.putText(frame, f"MODE: {mode}", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2)
+    
+    # Action info
+    if action:
+        cv2.putText(frame, action, (10, 60), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    
+    # Motor speeds
+    speed_text = f"L: {speed_l:.0f}%  R: {speed_r:.0f}%"
+    cv2.putText(frame, speed_text, (10, h - 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    # Time info
+    if time_info:
+        cv2.putText(frame, time_info, (w - 200, h - 20), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Direction indicator
+    center_x, center_y = w // 2, h // 2
+    if mode == "AUTO":
+        if "FORWARD" in action:
+            cv2.arrowedLine(frame, (center_x, center_y + 30), (center_x, center_y - 30), 
+                           (0, 255, 0), 3, tipLength=0.3)
+        elif "RIGHT" in action:
+            cv2.arrowedLine(frame, (center_x - 30, center_y), (center_x + 30, center_y), 
+                           (0, 255, 255), 3, tipLength=0.3)
+        elif "LEFT" in action:
+            cv2.arrowedLine(frame, (center_x + 30, center_y), (center_x - 30, center_y), 
+                           (255, 0, 255), 3, tipLength=0.3)
+    
+    return frame
 
 # ====== BOTTLE DETECTION ======
 def detect_bottle(results, fw, fh):
@@ -328,11 +345,9 @@ def detect_bottle(results, fw, fh):
             
             if conf > AI_CONFIDENCE_THRESHOLD:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                # Calculate center
                 x_cen = (x1 + x2) / 2
                 y_cen = (y1 + y2) / 2
                 
-                # Calculate size
                 bbox_area = (x2 - x1) * (y2 - y1)
                 area_ratio = bbox_area / (fw * fh)
                 
@@ -356,18 +371,29 @@ def pid_steer_to_bottle(bottle_x, fw, area_ratio):
     correction = (KP * error) + (KI * pid_integral) + (KD * deriv)
     correction = max(-1, min(1, correction))
     
-    # Speed based on distance
+    # ===== NEW: PREDICTIVE SLOWDOWN =====
+    # If error is small AND derivative shows we're converging fast, reduce speed
+    if abs(error) < 0.15 and abs(deriv) > 0.02:
+        # We're close to center AND moving fast toward it → SLOW DOWN
+        base_speed_multiplier = 0.6  # Reduce to 60% speed
+    else:
+        base_speed_multiplier = 1.0
+    
+    # Apply distance-based speed
     if area_ratio > AI_CLOSE_DISTANCE:
-        base = AI_CLOSE_APPROACH_SPEED
+        base = AI_CLOSE_APPROACH_SPEED * base_speed_multiplier
         status = " SLOW"
     else:
-        base = AI_APPROACH_SPEED
+        base = AI_APPROACH_SPEED * base_speed_multiplier
         status = " APPROACH"
     
+    # ===== NEW: DEAD ZONE FOR CENTERED =====
     if abs(error) < AI_CENTERING_THRESHOLD:
         l_spd = base
         r_spd = base
         status = " CENTERED - " + status
+        # Reset integral when centered to prevent overshoot
+        pid_integral = 0  
     else:
         l_spd, r_spd = smooth_turn(base, correction)
         if correction > 0:
@@ -382,7 +408,6 @@ def smart_search():
     global frames_without_target
     f = frames_without_target
     
-    # Phase timings 
     p1_end = LOOK_WAIT_FRAMES
     p2_end = p1_end + LOOK_TURN_FRAMES_45
     p3_end = p2_end + LOOK_WAIT_FRAMES
@@ -396,62 +421,184 @@ def smart_search():
     
     if f < p1_end:
         return 0, 0, f" CENTER ({f}/{LOOK_WAIT_FRAMES})"
-    
     elif f < p2_end:
-        # OPTION A: One motor only
         return LOOK_TURN_SPEED, 0, " TURN RIGHT 45°"
-        
-        # OPTION B: Counter-rotating
-        # return LOOK_TURN_SPEED, -LOOK_TURN_SPEED, "TURN RIGHT 45°"
-    
     elif f < p3_end:
         return 0, 0, f" LOOK RIGHT ({f-p2_end}/{LOOK_WAIT_FRAMES})"
-    
     elif f < p4_end:
-        # OPTION A: One motor only
         return 0, LOOK_TURN_SPEED, " RETURN CENTER"
-        
-        # OPTION B: Counter-rotating
-        # return -LOOK_TURN_SPEED, LOOK_TURN_SPEED, "RETURN CENTER"
-    
     elif f < p5_end:
         return 0, 0, f" CENTER ({f-p4_end}/{LOOK_WAIT_FRAMES})"
-    
     elif f < p6_end:
-        # OPTION A: One motor only
         return 0, LOOK_TURN_SPEED, " TURN LEFT 45°"
-        
-        # OPTION B: Counter-rotating
-        # return -LOOK_TURN_SPEED, LOOK_TURN_SPEED, "↺ TURN LEFT 45°"
-    
     elif f < p7_end:
         return 0, 0, f" LOOK LEFT ({f-p6_end}/{LOOK_WAIT_FRAMES})"
-    
     elif f < p8_end:
-        # OPTION A: One motor only (current)
         return LOOK_TURN_SPEED, 0, " RETURN CENTER"
-        
-        # OPTION B: Counter-rotating
-        # return LOOK_TURN_SPEED, -LOOK_TURN_SPEED, " RETURN CENTER"
-    
     elif f < p9_end:
         return 0, 0, f" FINAL CHECK ({f-p8_end}/{LOOK_WAIT_FRAMES})"
-    
     elif f < p10_end:
         return SEARCH_SPIN_SPEED, 0, " SPIN 360°"
-    
-        # 360° search - counter-rotating
-        # return SEARCH_SPIN_SPEED, -SEARCH_SPIN_SPEED, " 360° SEARCH"
-    
-    # else:
-       # return 0, 0, " STOPPED - NO TARGET"
-    
     else:
-        frames_without_target = 0  # Reset to loop search
+        frames_without_target = 0
         return 0, 0, " SEARCH RESTART"
 
+# ====== NAVIGATION MOVEMENTS ======
+def move_forward(motors, speed, duration, start_time):
+    global current_l_speed, current_r_speed
+    
+    elapsed = time.time() - start_time
+    
+    if elapsed < duration:
+        current_l_speed = smooth_speed_change(current_l_speed, speed)
+        current_r_speed = smooth_speed_change(current_r_speed, speed)
+        
+        motors.set_motors_percent(current_l_speed, current_r_speed)
+        
+        print(f" FORWARD | Speed: {speed}% | {elapsed:.1f}s / {duration}s", end='\r')
+        return False, f"FORWARD {speed}%", f"{elapsed:.1f}s / {duration}s"
+    else:
+        return True, "", ""
+
+def turn_right(motors, speed, duration, start_time):
+    global current_l_speed, current_r_speed
+    
+    elapsed = time.time() - start_time
+    
+    if elapsed < duration:
+        current_l_speed = smooth_speed_change(current_l_speed, speed)
+        current_r_speed = smooth_speed_change(current_r_speed, 0)
+        
+        motors.set_motors_percent(current_l_speed, current_r_speed)
+        
+        print(f"TURN RIGHT | {elapsed:.1f}s / {duration}s", end='\r')
+        return False, "TURN RIGHT", f"{elapsed:.1f}s / {duration}s"
+    else:
+        return True, "", ""
+
+def turn_left(motors, speed, duration, start_time):
+    global current_l_speed, current_r_speed
+    
+    elapsed = time.time() - start_time
+    
+    if elapsed < duration:
+        current_l_speed = smooth_speed_change(current_l_speed, 0)
+        current_r_speed = smooth_speed_change(current_r_speed, speed)
+        
+        motors.set_motors_percent(current_l_speed, current_r_speed)
+        
+        print(f"TURN LEFT | {elapsed:.1f}s / {duration}s", end='\r')
+        return False, "TURN LEFT", f"{elapsed:.1f}s / {duration}s"
+    else:
+        return True, "", ""
+
+# ====== NAVIGATION SEQUENCE ======
+def execute_navigation_sequence(motors, joystick):
+    global nav_mode, current_l_speed, current_r_speed
+    
+    sequence = [
+        ("forward", FORWARD_SPEED, 6),
+        ("right", TURN_SPEED, 5),
+        ("forward", FORWARD_SPEED, 6),
+        ("right", TURN_SPEED, 5),
+        ("forward", FORWARD_SPEED, 6),
+        ("right", TURN_SPEED, 5),
+        ("forward", FORWARD_SPEED, 6),
+        ("stop", 0, 0)
+    ]
+    
+    step = 0
+    start_time = time.time()
+    action_text = ""
+    time_text = ""
+
+    print("\n Starting Navigation Sequence...\n")
+    
+    while step < len(sequence) and nav_mode == "AUTO":
+        # Read camera frame
+        if cam and cam.isOpened():
+            ret, frame = cam.read()
+            if not ret:
+                frame = None
+        else:
+            frame = None
+        
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return
+        
+        if joystick:
+            # Triangle - Back to manual
+            if joystick.get_button(2):
+                nav_mode = "MANUAL"
+                motors.stop()
+                current_l_speed = 0
+                current_r_speed = 0
+                print("\n\n MANUAL MODE - Navigation aborted")
+                time.sleep(0.3)
+                return
+            
+            # Circle - Emergency stop
+            if joystick.get_button(1):
+                motors.stop()
+                current_l_speed = 0
+                current_r_speed = 0
+                print("\n\n EMERGENCY STOP")
+                time.sleep(0.5)
+                continue
+
+            # Options - Quit
+            if joystick.get_button(9):
+                break
+        
+        # Execute current step
+        action, speed, duration = sequence[step]
+        
+        if action == "forward":
+            finished, action_text, time_text = move_forward(motors, speed, duration, start_time)
+        elif action == "right":
+            finished, action_text, time_text = turn_right(motors, speed, duration, start_time)
+        elif action == "left":
+            finished, action_text, time_text = turn_left(motors, speed, duration, start_time)
+        elif action == "stop":
+            motors.stop()
+            current_l_speed = 0
+            current_r_speed = 0
+            action_text = "SEQUENCE COMPLETE"
+            print("\n\n Navigation Sequence Complete!")
+            
+            # Show completion on camera for 2 seconds
+            if frame is not None and SHOW_CAMERA:
+                for _ in range(40):
+                    if cam and cam.isOpened():
+                        ret, frame = cam.read()
+                        if ret:
+                            frame = draw_camera_overlay(frame, "AUTO", action_text, 0, 0, "")
+                            cv2.imshow("Catamaran Navigation", frame)
+                            cv2.waitKey(50)
+            else:
+                time.sleep(2)
+            break
+        
+        # Display camera with overlay
+        if frame is not None and SHOW_CAMERA:
+            frame = draw_camera_overlay(frame, "AUTO", action_text, 
+                                       current_l_speed, current_r_speed, time_text)
+            cv2.imshow("Catamaran Navigation", frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                nav_mode = "MANUAL"
+                return
+        
+        if finished:
+            print()
+            step += 1
+            start_time = time.time()
+        
+        time.sleep(0.05)
+
 # ====== CONTROL MODES ======
-def mode_ps4_advanced(motors,joy):
+def mode_ps4_advanced(motors, joy):
     print("\n" + "=" * 70)
     print("MODE 1: PS4 ADVANCED - R2 SPEED + STICK DIFFERENTIAL")
     print("=" * 70)
@@ -472,48 +619,48 @@ def mode_ps4_advanced(motors,joy):
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+
+                 # Controller disconnection detection
+                if event.type == pygame.JOYDEVICEREMOVED:
+                   print("\n\n CONTROLLER DISCONNECTED - EMERGENCY STOP")
+                   motors.stop()
+                   current_l_speed = 0
+                   current_r_speed = 0
+                   running = False
+                   break
             
-            # R2 controls master speed (0-100%, scaled to INITIAL_MAX_SPEED)
-            r2_raw = (joy.get_axis(5) + 1) / 2  # -1 to 1 → 0 to 1
-            r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)  # Apply sensitivity
+            r2_raw = (joy.get_axis(5) + 1) / 2
+            r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
             master_speed = r2_raw * INITIAL_MAX_SPEED
             
-            # Left stick X controls differential (-1 to 1)
             stick_x = apply_deadzone(joy.get_axis(0))
             
-            # Calculate motor speeds based on stick position
             if abs(stick_x) < 0.05:
-                # Center: both motors equal
                 target_l = master_speed
                 target_r = master_speed
                 blend_status = "BOTH"
             elif stick_x > 0:
-                # Right: left motor full, right motor reduced
                 target_l = master_speed
-                target_r = master_speed * (1 - stick_x)  # 0 to 100% right = 100% to 0%
+                target_r = master_speed * (1 - stick_x)
                 blend_status = f"R {stick_x*100:.0f}%"
             else:
-                # Left: right motor full, left motor reduced
                 target_r = master_speed
-                target_l = master_speed * (1 + stick_x)  # -100% to 0% left = 0% to 100%
+                target_l = master_speed * (1 + stick_x)
                 blend_status = f"L {-stick_x*100:.0f}%"
             
-            # Smooth acceleration
-            current_l_speed = smooth_speed_change(current_l_speed, target_l,
-                                                  ACCELERATION_RATE, DECELERATION_RATE)
-            current_r_speed = smooth_speed_change(current_r_speed, target_r,
-                                                  ACCELERATION_RATE, DECELERATION_RATE)
+            current_l_speed = smooth_speed_change(current_l_speed, target_l)
+            current_r_speed = smooth_speed_change(current_r_speed, target_r)
             
             motors.set_motors_percent(current_l_speed, current_r_speed)
             
-            if joy.get_button(1):  # Circle - Emergency stop
+            if joy.get_button(1):
                 current_l_speed = 0
                 current_r_speed = 0
                 motors.stop()
                 print("\n STOP")
                 time.sleep(0.3)
             
-            if joy.get_button(9):  # Options - Quit
+            if joy.get_button(9):
                 running = False
             
             if master_speed > 0.5:
@@ -561,8 +708,16 @@ def mode_ai_simple_advanced(motors, servo, joy):
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-            
-            # Triangle - Toggle AI
+
+                # Controller disconnection detection
+                if event.type == pygame.JOYDEVICEREMOVED:
+                   print("\n\n CONTROLLER DISCONNECTED - EMERGENCY STOP")
+                   motors.stop()
+                   current_l_speed = 0
+                   current_r_speed = 0
+                   running = False
+                   break
+
             if joy.get_button(2):
                 ai_enabled = not ai_enabled
                 if ai_enabled:
@@ -577,7 +732,6 @@ def mode_ai_simple_advanced(motors, servo, joy):
                 current_r_speed = 0
                 time.sleep(0.3)
             
-            # Circle - Emergency stop
             if joy.get_button(1):
                 motors.stop()
                 current_l_speed = 0
@@ -586,24 +740,22 @@ def mode_ai_simple_advanced(motors, servo, joy):
                 time.sleep(0.3)
                 continue
             
-            # Options - Quit
             if joy.get_button(9):
                 running = False
                 break
             
             if ai_enabled:
-                # AI MODE
                 results = model(frame, conf=AI_CONFIDENCE_THRESHOLD, verbose=False)
                 annotated = results[0].plot()
                 
-                detected, bx, by, conf, area = detect_bottle(results, fw, fh)
-                
+                detected, bx, by, conf, area_ratio = detect_bottle(results, fw, fh)
+ 
                 if detected:
-                    # BOTTLE DETECTED - All visual code goes HERE
+                    # BOTTLE DETECTED 
                     frames_without_target = 0
                     servo.open_net()
                     
-                    target_l, target_r, status = pid_steer_to_bottle(bx, fw, area)
+                    target_l, target_r, status = pid_steer_to_bottle(bx, fw, area_ratio)
                     
                     # Smooth speed changes
                     current_l_speed = smooth_speed_change(current_l_speed, target_l, ACCELERATION_RATE, DECELERATION_RATE)
@@ -611,7 +763,7 @@ def mode_ai_simple_advanced(motors, servo, joy):
                     
                     motors.set_motors_percent(current_l_speed, current_r_speed)
                     
-                    # Draw visuals (bx, by are valid here)
+                    # Draw visuals 
                     # Frame center line (yellow)
                     cv2.line(annotated, (int(fw/2), 0), (int(fw/2), fh), (255, 255, 0), 2)
                     # Bottle center line (green)
@@ -629,7 +781,7 @@ def mode_ai_simple_advanced(motors, servo, joy):
                     print(f"{status} | L:{current_l_speed:.0f}% R:{current_r_speed:.0f}%", end='\r')
                 
                 else:
-                    # NO BOTTLE - Different visuals
+                    # NO BOTTLE 
                     frames_without_target += 1
                     servo.close_net()
                     
@@ -733,7 +885,16 @@ def mode_ai_search_advanced(motors, servo, joy):
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-            
+
+              # Controller disconnection detection
+                if event.type == pygame.JOYDEVICEREMOVED:
+                   print("\n\n CONTROLLER DISCONNECTED - EMERGENCY STOP")
+                   motors.stop()
+                   current_l_speed = 0
+                   current_r_speed = 0
+                   running = False
+                   break
+
             # Triangle - Toggle AI
             if joy.get_button(2):
                 ai_enabled = not ai_enabled
@@ -768,14 +929,14 @@ def mode_ai_search_advanced(motors, servo, joy):
                 results = model(frame, conf=AI_CONFIDENCE_THRESHOLD, verbose=False)
                 annotated = results[0].plot()
                 
-                detected, bx, by, conf, area = detect_bottle(results, fw, fh)
+                detected, bx, by, conf, area_ratio = detect_bottle(results, fw, fh)
                 
                 if detected:
                     # TARGET FOUND - Draw visuals
                     frames_without_target = 0
                     servo.open_net()
-                    
-                    target_l, target_r, status = pid_steer_to_bottle(bx, fw, area)
+            
+                    target_l, target_r, status = pid_steer_to_bottle(bx, fw, area_ratio)
                     
                     # Smooth speed changes
                     current_l_speed = smooth_speed_change(current_l_speed, target_l, ACCELERATION_RATE, DECELERATION_RATE)
@@ -801,7 +962,7 @@ def mode_ai_search_advanced(motors, servo, joy):
                     print(f"{status} | L:{current_l_speed:.0f}% R:{current_r_speed:.0f}%", end='\r')
                 
                 else:
-                    # TARGET LOST - SEARCH PATTERN (no bottle coordinates)
+                    # TARGET LOST - SEARCH PATTERN 
                     frames_without_target += 1
                     servo.close_net()
                     
@@ -876,6 +1037,127 @@ def mode_ai_search_advanced(motors, servo, joy):
             cv2.destroyAllWindows()
             cv2.waitKey(1)
 
+def mode_navigation(motors, joystick):
+    # Mode 4: Timed Navigation with Manual/Auto Toggle
+    global nav_mode, current_l_speed, current_r_speed
+    
+    print("\n" + "=" * 70)
+    print("MODE 4: TIMED NAVIGATION")
+    print("=" * 70)
+    print("\n Triangle: Toggle MANUAL ↔ AUTO Navigation")
+    print("   Circle: Emergency Stop")
+    print("   R2 + Left Stick: Manual control")
+    print("   Options: Quit\n")
+    print(" Starting in MANUAL mode\n")
+    
+    nav_mode = "MANUAL"
+    current_l_speed = 0
+    current_r_speed = 0
+    
+    clock = pygame.time.Clock()
+    running = True
+    
+    try:
+        while running:
+            # Read camera frame
+            if cam and cam.isOpened():
+                ret, frame = cam.read()
+                if not ret:
+                    frame = None
+            else:
+                frame = None
+            
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                    
+            # Controller disconnection detection
+                if event.type == pygame.JOYDEVICEREMOVED:   
+                   print("\n\n CONTROLLER DISCONNECTED - EMERGENCY STOP")
+                   motors.stop()
+                   current_l_speed = 0
+                   current_r_speed = 0
+                   running = False
+                   break
+
+            if joystick:
+                # Triangle - Toggle mode
+                if joystick.get_button(2):
+                    if nav_mode == "MANUAL":
+                        nav_mode = "AUTO"
+                        current_l_speed = 0
+                        current_r_speed = 0
+                        print("\n\n AUTO NAVIGATION MODE\n")
+                        time.sleep(0.5)
+                        execute_navigation_sequence(motors, joystick)
+                        # After sequence completes, return to manual
+                        nav_mode = "MANUAL"
+                        print("\n\n MANUAL MODE\n")
+                    time.sleep(0.3)
+                
+                # Circle - Emergency stop
+                if joystick.get_button(1):
+                    motors.stop()
+                    current_l_speed = 0
+                    current_r_speed = 0
+                    print("\n EMERGENCY STOP")
+                    time.sleep(0.3)
+                    continue
+                
+                # Options - Quit back to menu
+                if joystick.get_button(9):
+                    running = False
+                    break
+            
+            # Execute current mode
+            if nav_mode == "MANUAL" and joystick:
+                # Manual control logic
+                r2_raw = (joystick.get_axis(5) + 1) / 2
+                r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
+                master_speed = r2_raw * INITIAL_MAX_SPEED
+                
+                stick_x = apply_deadzone(joystick.get_axis(0))
+                
+                if abs(stick_x) < 0.05:
+                    target_l = master_speed
+                    target_r = master_speed
+                    blend_status = "BOTH"
+                elif stick_x > 0:
+                    target_l = master_speed
+                    target_r = master_speed * (1 - stick_x)
+                    blend_status = f"R {stick_x*100:.0f}%"
+                else:
+                    target_r = master_speed
+                    target_l = master_speed * (1 + stick_x)
+                    blend_status = f"L {-stick_x*100:.0f}%"
+                
+                current_l_speed = smooth_speed_change(current_l_speed, target_l)
+                current_r_speed = smooth_speed_change(current_r_speed, target_r)
+                
+                motors.set_motors_percent(current_l_speed, current_r_speed)
+                
+                if master_speed > 0.5:
+                    print(f" MANUAL | Speed: {master_speed:.1f}% | {blend_status} | L:{current_l_speed:.0f}% R:{current_r_speed:.0f}%", end='\r')
+                
+                # Display camera in manual mode
+                if frame is not None and SHOW_CAMERA:
+                    frame = draw_camera_overlay(frame, "MANUAL", "R2 + Stick Control", 
+                                               current_l_speed, current_r_speed, "")
+                    cv2.imshow("Catamaran Navigation", frame)
+                    
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        running = False
+            
+            clock.tick(20)
+    
+    except KeyboardInterrupt:
+        print("\n\n Interrupted")
+    finally:
+        motors.stop()
+        if SHOW_CAMERA:
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+
 # ====== MAIN ======
 def main():
     
@@ -883,7 +1165,6 @@ def main():
     setup_pca()
     joystick = init_ps4() # Joystick = None if not found
     
-    # Require joystick for 3-mode setup
     if not joystick:
         print(" PS4 controller required for all modes")
         print("  Aborting startup\n")
@@ -905,11 +1186,12 @@ def main():
         print("=" * 70)
 
         print(f"  1. PS4 Advanced (R2 speed + stick differential)")
-        print(f"  2. AI Simple + R2 Speed + Stick Differential")
-        print(f"  3. AI Smart Search + R2 Speed + Stick Differential")
-        print(f"  4. Exit")
+        print(f"  2. AI Simple Chase")
+        print(f"  3. AI Smart Search")
+        print(f"  4. Navigation Sequence")
+        print(f"  5. Exit")
         
-        choice = input("\nChoice (1-4): ").strip() # strips whitespace and returns characters only
+        choice = input("\nChoice (1-5): ").strip() # strips whitespace and returns characters only
         
         if choice == "1":
             if not joystick:
@@ -928,8 +1210,14 @@ def main():
                 print(" Need PS4 controller")
                 continue
             mode_ai_search_advanced(motors,servo,joystick)
-        
+
         elif choice == "4":
+            if not joystick:
+                print(" Need PS4 controller")
+                continue
+            mode_navigation(motors, joystick)
+        
+        elif choice == "5":
             print("\n Ciao!")
             break
         

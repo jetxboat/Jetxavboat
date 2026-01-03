@@ -1,9 +1,11 @@
+Jetxavboat
 """
-CATAMARAN BLDC BOAT CONTROLLER
-4 modes:
+CATAMARAN BI BLDC BOAT CONTROLLER
+5 modes:
+0. Manual Pulse Test (Bidirectional)
 1. PS4 Advanced (R2=speed, left stick=differential control)
-2. AI Simple + R2 Speed + Stick Differential
-3. AI Smart Search + R2 Speed + Stick Differential
+2. AI Simple + R2 FWD Speed + L2 REV Speed + Stick Differential
+3. AI Smart Search + R2 FWD Speed  + L2 REV Speed+ Stick Differential
 4. Timed Navigation (Toggle MANUAL ↔ AUTO)
 """
 
@@ -24,24 +26,27 @@ MOTOR_R_CHANNEL = 1
 SERVO1_CHANNEL = 3
 
 # DISCOVERED VALUES 
-MOTOR_L_MIN = 3900
-MOTOR_L_MAX = 5500
-MOTOR_R_MIN = 3900
-MOTOR_R_MAX = 5500
 
+# BI MOTORS
+MOTOR_NEUTRAL = 4700      # Dead stop
+MOTOR_FWD_MAX = 5500      # Full forward
+MOTOR_REV_MAX = 3900      # Full reverse
+
+# SERVO CONFIGURATION
 SERVO1_MIN = 1800
 SERVO1_CENTER = 4000
 SERVO1_MAX = 8400
 
 # SAFETY LIMIT
-MOTOR_SAFE_MAX = 4900
+MOTOR_SAFE_FWD_MAX = 4900
+MOTOR_SAFE_REV_MAX = 3900
 
 # START LIMIT
 INITIAL_MAX_SPEED = 65 # % Changed with each test
 
 # ====== NAVIGATION SPEEDS ======
 FORWARD_SPEED = 40  # %
-TURN_SPEED = 30     # % 
+TURN_SPEED = 30     # % BI
 
 # Motor trim
 MOTOR_L_TRIM = 1.0
@@ -54,7 +59,7 @@ R2_SENSITIVITY = 1.3
 # ====== AI PARAMETERS ======
 MODEL = "best7.pt"
 AI_APPROACH_SPEED = 30          
-AI_CLOSE_APPROACH_SPEED = 20   
+AI_CLOSE_APPROACH_SPEED = 20    
 AI_CENTERING_THRESHOLD = 0.25
 AI_CLOSE_DISTANCE = 0.4
 AI_CONFIDENCE_THRESHOLD = 0.8
@@ -66,10 +71,10 @@ KI = 0.007 # 0.005
 KD = 0.5 # 0.15
 
 # ====== SEARCH PARAMETERS ======
-LOOK_TURN_SPEED = 30
+LOOK_TURN_SPEED = 30 # BI
 LOOK_TURN_FRAMES_45 = 25
 LOOK_WAIT_FRAMES = 40
-SEARCH_SPIN_SPEED = 40
+SEARCH_SPIN_SPEED = 40 # 360 
 
 # ====== SMOOTHING ======
 ACCELERATION_RATE = 2.3
@@ -82,9 +87,9 @@ current_r_speed = 0.0
 # ====== DISPLAY ======
 SHOW_CAMERA = True  # False for SSH
 
-print("=" * 70)
+print("=" * 50)
 print(" CATAMARAN BLDC BOAT CONTROLLER ")
-print("=" * 70)
+print("=" * 50)
 
 # Globals
 pca = None
@@ -156,70 +161,96 @@ def init_ps4():
     print("✗ No PS4 controller detected")
     return None
 
-# ====== MOTOR CONTROLLER ======
+# ====== BI MOTOR CONTROLLER ======
 class MotorController:
     def __init__(self):
         self.l_ch = pca.channels[MOTOR_L_CHANNEL]
         self.r_ch = pca.channels[MOTOR_R_CHANNEL]
         
-        self.l_safe_pct = ((MOTOR_SAFE_MAX - MOTOR_L_MIN) / (MOTOR_L_MAX - MOTOR_L_MIN)) * 100
-        self.r_safe_pct = ((MOTOR_SAFE_MAX - MOTOR_R_MIN) / (MOTOR_R_MAX - MOTOR_R_MIN)) * 100
+        # Calculate safe percentage range
+        fwd_range = MOTOR_SAFE_FWD_MAX - MOTOR_NEUTRAL
+        total_fwd_range = MOTOR_FWD_MAX - MOTOR_NEUTRAL
+        self.safe_fwd_pct = (fwd_range / total_fwd_range) * 100
         
-        print(f"Motor Limits:")
-        print(f"  Left:  {MOTOR_L_MIN}-{MOTOR_SAFE_MAX}µs ({self.l_safe_pct:.0f}% max)")
-        print(f"  Right: {MOTOR_R_MIN}-{MOTOR_SAFE_MAX}µs ({self.r_safe_pct:.0f}% max)")
-        print(f"  Initial speed limit: {INITIAL_MAX_SPEED}%\n")
+        rev_range = MOTOR_NEUTRAL - MOTOR_SAFE_REV_MAX
+        total_rev_range = MOTOR_NEUTRAL - MOTOR_REV_MAX
+        self.safe_rev_pct = (rev_range / total_rev_range) * 100
+        
+        print(f"Motor Limits (Bidirectional):")
+        print(f"  Reverse: {MOTOR_SAFE_REV_MAX}-{MOTOR_REV_MAX}µs (0-{self.safe_rev_pct:.0f}%)")
+        print(f"  Neutral: {MOTOR_NEUTRAL}µs (0%)")
+        print(f"  Forward: {MOTOR_NEUTRAL}-{MOTOR_SAFE_FWD_MAX}µs (0-{self.safe_fwd_pct:.0f}%)")
+        print(f"  Initial speed limit: ±{INITIAL_MAX_SPEED}%\n")
     
     def percent_to_pulse(self, pct_l, pct_r):
+        # Convert -100 to +100 percent to PWM pulse
+        # Apply motor trim
         pct_l *= MOTOR_L_TRIM
         pct_r *= MOTOR_R_TRIM
         
-        pct_l = max(0, min(self.l_safe_pct, pct_l))
-        pct_r = max(0, min(self.r_safe_pct, pct_r))
+        # Clamp to safe limits
+        pct_l = max(-self.safe_rev_pct, min(self.safe_fwd_pct, pct_l))
+        pct_r = max(-self.safe_rev_pct, min(self.safe_fwd_pct, pct_r))
         
-        pulse_l = MOTOR_L_MIN + (MOTOR_L_MAX - MOTOR_L_MIN) * pct_l / 100
-        pulse_r = MOTOR_R_MIN + (MOTOR_R_MAX - MOTOR_R_MIN) * pct_r / 100
+        # Map percentage to pulse - LEFT MOTOR
+        if pct_l >= 0:  # Forward
+            pulse_l = MOTOR_NEUTRAL + (MOTOR_FWD_MAX - MOTOR_NEUTRAL) * pct_l / 100
+        else:  # Reverse
+            pulse_l = MOTOR_NEUTRAL + (MOTOR_NEUTRAL - MOTOR_REV_MAX) * pct_l / 100
         
-        pulse_l = min(MOTOR_SAFE_MAX, int(pulse_l))
-        pulse_r = min(MOTOR_SAFE_MAX, int(pulse_r))
+        # Map percentage to pulse - RIGHT MOTOR
+        if pct_r >= 0:  # Forward
+            pulse_r = MOTOR_NEUTRAL + (MOTOR_FWD_MAX - MOTOR_NEUTRAL) * pct_r / 100
+        else:  # Reverse
+            pulse_r = MOTOR_NEUTRAL + (MOTOR_NEUTRAL - MOTOR_REV_MAX) * pct_r / 100
+        
+        # Safety clamp to absolute limits
+        pulse_l = max(MOTOR_REV_MAX, min(MOTOR_FWD_MAX, int(pulse_l)))
+        pulse_r = max(MOTOR_REV_MAX, min(MOTOR_FWD_MAX, int(pulse_r)))
         
         return pulse_l, pulse_r
     
     def set_motors_percent(self, pct_l, pct_r):
+        # Set motors using -100 to +100 percent
         pulse_l, pulse_r = self.percent_to_pulse(pct_l, pct_r)
         self.l_ch.duty_cycle = pulse_l
         self.r_ch.duty_cycle = pulse_r
         return pulse_l, pulse_r
     
     def set_motors_pulse(self, pulse_l, pulse_r):
-        pulse_l = max(MOTOR_L_MIN, min(MOTOR_SAFE_MAX, int(pulse_l)))
-        pulse_r = max(MOTOR_R_MIN, min(MOTOR_SAFE_MAX, int(pulse_r)))
+        # Set motors using raw PWM pulses
+        pulse_l = max(MOTOR_REV_MAX, min(MOTOR_FWD_MAX, int(pulse_l)))
+        pulse_r = max(MOTOR_REV_MAX, min(MOTOR_FWD_MAX, int(pulse_r)))
         self.l_ch.duty_cycle = pulse_l
         self.r_ch.duty_cycle = pulse_r
         return pulse_l, pulse_r
     
     def arm_motors(self):
-        print("\n  Arming ESCs...")
-        print("   Setting minimum throttle...")
+        # Arm ESCs for bidirectional mode
+        print("\n Arming Bidirectional ESCs...")
+        print("   Setting NEUTRAL throttle...")
         
-        self.l_ch.duty_cycle = MOTOR_L_MIN
-        self.r_ch.duty_cycle = MOTOR_R_MIN
+        # Set to neutral (not minimum)
+        self.l_ch.duty_cycle = MOTOR_NEUTRAL
+        self.r_ch.duty_cycle = MOTOR_NEUTRAL
         
-        print(f"   Left:  {MOTOR_L_MIN}µs")
-        print(f"   Right: {MOTOR_R_MIN}µs")
+        print(f"   Left:  {MOTOR_NEUTRAL}µs (neutral)")
+        print(f"   Right: {MOTOR_NEUTRAL}µs (neutral)")
         
-        print("   Waiting for beep sequence...")
+        print("   Waiting for ESC initialization...")
         for i in range(3, 0, -1):
             print(f"   {i}...")
             time.sleep(1)
         
-        print("   ✓ Motors armed and ready!\n")
+        print("   ✓ Motors armed !\n")
     
     def stop(self):
-        self.l_ch.duty_cycle = MOTOR_L_MIN
-        self.r_ch.duty_cycle = MOTOR_R_MIN
+        # Stop motors (return to neutral)
+        self.l_ch.duty_cycle = MOTOR_NEUTRAL
+        self.r_ch.duty_cycle = MOTOR_NEUTRAL
     
     def cleanup(self):
+        # Safe shutdown
         self.stop()
         time.sleep(0.5)
         self.l_ch.duty_cycle = 0
@@ -362,6 +393,13 @@ def pid_steer_to_bottle(bottle_x, fw, area_ratio):
     fc = fw / 2
     error = (bottle_x - fc) / fc
     
+   # # If very off-center, rotate in place first
+   #  if abs(error) > 0.5:  # >50% off-center
+   #      if error > 0:
+   #         return LOOK_TURN_SPEED, -LOOK_TURN_SPEED, "⟳ CENTERING RIGHT"
+   #     else:
+   #         return -LOOK_TURN_SPEED, LOOK_TURN_SPEED, "⟲ CENTERING LEFT"
+        
     pid_integral += error
     pid_integral = max(-1, min(1, pid_integral))
     
@@ -371,7 +409,7 @@ def pid_steer_to_bottle(bottle_x, fw, area_ratio):
     correction = (KP * error) + (KI * pid_integral) + (KD * deriv)
     correction = max(-1, min(1, correction))
     
-    # ===== NEW: PREDICTIVE SLOWDOWN =====
+    # ===== PREDICTIVE SLOWDOWN =====
     # If error is small AND derivative shows we're converging fast, reduce speed
     if abs(error) < 0.15 and abs(deriv) > 0.02:
         # We're close to center AND moving fast toward it → SLOW DOWN
@@ -386,8 +424,8 @@ def pid_steer_to_bottle(bottle_x, fw, area_ratio):
     else:
         base = AI_APPROACH_SPEED * base_speed_multiplier
         status = " APPROACH"
-    
-    # ===== NEW: DEAD ZONE FOR CENTERED =====
+
+    # ===== DEAD ZONE FOR CENTERED =====
     if abs(error) < AI_CENTERING_THRESHOLD:
         l_spd = base
         r_spd = base
@@ -421,26 +459,55 @@ def smart_search():
     
     if f < p1_end:
         return 0, 0, f" CENTER ({f}/{LOOK_WAIT_FRAMES})"
+    
     elif f < p2_end:
-        return LOOK_TURN_SPEED, 0, " TURN RIGHT 45°"
+        # OPTION A: One motor only
+        # return LOOK_TURN_SPEED, 0, " TURN RIGHT 45°"
+        
+        # OPTION B: Counter-rotating
+        return LOOK_TURN_SPEED, -LOOK_TURN_SPEED, "TURN RIGHT 45°"
+    
     elif f < p3_end:
         return 0, 0, f" LOOK RIGHT ({f-p2_end}/{LOOK_WAIT_FRAMES})"
+    
     elif f < p4_end:
-        return 0, LOOK_TURN_SPEED, " RETURN CENTER"
+        # OPTION A: One motor only
+        # return 0, LOOK_TURN_SPEED, " RETURN CENTER"
+        
+        # OPTION B: Counter-rotating
+        return -LOOK_TURN_SPEED, LOOK_TURN_SPEED, "RETURN CENTER"
+    
     elif f < p5_end:
         return 0, 0, f" CENTER ({f-p4_end}/{LOOK_WAIT_FRAMES})"
+    
     elif f < p6_end:
-        return 0, LOOK_TURN_SPEED, " TURN LEFT 45°"
+        # OPTION A: One motor only
+        # return 0, LOOK_TURN_SPEED, " TURN LEFT 45°"
+        
+        # OPTION B: Counter-rotating
+        return -LOOK_TURN_SPEED, LOOK_TURN_SPEED, "↺ TURN LEFT 45°"
+    
     elif f < p7_end:
         return 0, 0, f" LOOK LEFT ({f-p6_end}/{LOOK_WAIT_FRAMES})"
+    
     elif f < p8_end:
-        return LOOK_TURN_SPEED, 0, " RETURN CENTER"
+        # OPTION A: One motor only (current)
+        # return LOOK_TURN_SPEED, 0, " RETURN CENTER"
+        
+        # OPTION B: Counter-rotating
+        return LOOK_TURN_SPEED, -LOOK_TURN_SPEED, " RETURN CENTER"
+    
     elif f < p9_end:
         return 0, 0, f" FINAL CHECK ({f-p8_end}/{LOOK_WAIT_FRAMES})"
+    
     elif f < p10_end:
-        return SEARCH_SPIN_SPEED, 0, " SPIN 360°"
+        # return SEARCH_SPIN_SPEED, 0, " SPIN 360°"
+    
+        # 360° search - counter-rotating
+        return SEARCH_SPIN_SPEED, -SEARCH_SPIN_SPEED, " 360° SEARCH"
+    
     else:
-        frames_without_target = 0
+        frames_without_target = 0  # Reset to loop search
         return 0, 0, " SEARCH RESTART"
 
 # ====== NAVIGATION MOVEMENTS ======
@@ -467,7 +534,7 @@ def turn_right(motors, speed, duration, start_time):
     
     if elapsed < duration:
         current_l_speed = smooth_speed_change(current_l_speed, speed)
-        current_r_speed = smooth_speed_change(current_r_speed, 0)
+        current_r_speed = smooth_speed_change(current_r_speed, -speed)
         
         motors.set_motors_percent(current_l_speed, current_r_speed)
         
@@ -482,7 +549,7 @@ def turn_left(motors, speed, duration, start_time):
     elapsed = time.time() - start_time
     
     if elapsed < duration:
-        current_l_speed = smooth_speed_change(current_l_speed, 0)
+        current_l_speed = smooth_speed_change(current_l_speed, -speed)
         current_r_speed = smooth_speed_change(current_r_speed, speed)
         
         motors.set_motors_percent(current_l_speed, current_r_speed)
@@ -598,6 +665,88 @@ def execute_navigation_sequence(motors, joystick):
         time.sleep(0.05)
 
 # ====== CONTROL MODES ======
+
+def mode_manual_pulse(motors):
+    # Manual pulse testing for bidirectional thrusters
+    print("\n" + "=" * 50)
+    print("MODE: MANUAL PULSE TEST (BIDIRECTIONAL)")
+    print("=" * 50)
+    print(f"\nPulse ranges:")
+    print(f"  Reverse: {MOTOR_REV_MAX}µs")
+    print(f"  Neutral: {MOTOR_NEUTRAL}µs")
+    print(f"  Forward: {MOTOR_NEUTRAL} - {MOTOR_FWD_MAX}µs")
+    print("Commands:")
+    print("  #### ####  : Set L and R pulse (e.g., 4700 4700)")
+    print("  test       : Run calibration sequence")
+    print("  q          : Quit\n")
+    
+    try:
+        while True:
+            cmd = input(f"Pulse [L R] or 'test': ").strip().lower()
+            
+            if cmd == 'q':
+                break
+            
+            elif cmd == 'test':
+                print("\n Running calibration sequence...")
+                print("   Testing NEUTRAL (should not spin)...")
+                motors.set_motors_pulse(MOTOR_NEUTRAL, MOTOR_NEUTRAL)
+                input("   Press ENTER to continue...")
+                
+                print("   Testing FORWARD 30%...")
+                fwd_30 = int(MOTOR_NEUTRAL + (MOTOR_FWD_MAX - MOTOR_NEUTRAL) * 0.3)
+                motors.set_motors_pulse(fwd_30, fwd_30)
+                input("   Press ENTER to continue...")
+                
+                print("   Testing REVERSE 30%...")
+                rev_30 = int(MOTOR_NEUTRAL - (MOTOR_NEUTRAL - MOTOR_REV_MAX) * 0.3)
+                motors.set_motors_pulse(rev_30, rev_30)
+                input("   Press ENTER to stop...")
+                
+                motors.stop()
+                print("   ✓ Test complete\n")
+            
+            else:
+                try:
+                    parts = cmd.split()
+                    if len(parts) == 2:
+                        pl = int(parts[0])
+                        pr = int(parts[1])
+                        
+                        # Safety check
+                        if (pl < MOTOR_REV_MAX or pl > MOTOR_FWD_MAX or
+                            pr < MOTOR_REV_MAX or pr > MOTOR_FWD_MAX):
+                            print(f"  ✗ Out of range! Use {MOTOR_REV_MAX}-{MOTOR_FWD_MAX}")
+                            continue
+                        
+                        al, ar = motors.set_motors_pulse(pl, pr)
+                        
+                        # Calculate percentages for display
+                        if pl >= MOTOR_NEUTRAL:
+                            l_pct = ((pl - MOTOR_NEUTRAL) / (MOTOR_FWD_MAX - MOTOR_NEUTRAL)) * 100
+                        else:
+                            l_pct = -((MOTOR_NEUTRAL - pl) / (MOTOR_NEUTRAL - MOTOR_REV_MAX)) * 100
+                        
+                        if pr >= MOTOR_NEUTRAL:
+                            r_pct = ((pr - MOTOR_NEUTRAL) / (MOTOR_FWD_MAX - MOTOR_NEUTRAL)) * 100
+                        else:
+                            r_pct = -((MOTOR_NEUTRAL - pr) / (MOTOR_NEUTRAL - MOTOR_REV_MAX)) * 100
+                        
+                        print(f"  ✓ Set: L={al}µs ({l_pct:+.0f}%), R={ar}µs ({r_pct:+.0f}%)")
+                    
+                    else:
+                        print("  ✗ Invalid - use: 4700 4700")
+                
+                except ValueError:
+                    print("  ✗ Invalid - use numbers: 4700 4700")
+                except Exception as e:
+                    print(f"  ✗ Error: {e}")
+    
+    except KeyboardInterrupt:
+        print("\n Interrupted")
+    finally:
+        motors.stop()
+
 def mode_ps4_advanced(motors, joy):
     print("\n" + "=" * 70)
     print("MODE 1: PS4 ADVANCED - R2 SPEED + STICK DIFFERENTIAL")
@@ -629,10 +778,15 @@ def mode_ps4_advanced(motors, joy):
                    running = False
                    break
             
-            r2_raw = (joy.get_axis(5) + 1) / 2
-            r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
-            master_speed = r2_raw * INITIAL_MAX_SPEED
-            
+            # Check L2 (reverse) 
+            l2_raw = (joy.get_axis(2) + 1) / 2
+            if l2_raw > 0.1:  # L2 pressed = reverse
+               master_speed = -l2_raw * INITIAL_MAX_SPEED
+            else:  # check R2 (forward)
+               r2_raw = (joy.get_axis(5) + 1) / 2
+               r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
+               master_speed = r2_raw * INITIAL_MAX_SPEED
+
             stick_x = apply_deadzone(joy.get_axis(0))
             
             if abs(stick_x) < 0.05:
@@ -802,10 +956,14 @@ def mode_ai_simple_advanced(motors, servo, joy):
                     cv2.imshow("Catamaran", annotated)
             
             else:
-                # MANUAL MODE - R2 Speed + Stick Differential
-                r2_raw = (joy.get_axis(5) + 1) / 2
-                r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
-                master_speed = r2_raw * INITIAL_MAX_SPEED
+                # MANUAL MODE - L2/R2 Speed + Stick Differential
+                l2_raw = (joy.get_axis(2) + 1) / 2
+                if l2_raw > 0.1:
+                    master_speed = -l2_raw * INITIAL_MAX_SPEED
+                else:
+                    r2_raw = (joy.get_axis(5) + 1) / 2
+                    r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
+                    master_speed = r2_raw * INITIAL_MAX_SPEED
                 
                 stick_x = apply_deadzone(joy.get_axis(0))
                 
@@ -989,10 +1147,14 @@ def mode_ai_search_advanced(motors, servo, joy):
                     cv2.imshow("Catamaran", annotated)
             
             else:
-                # MANUAL MODE - R2 Speed + Stick Differential
-                r2_raw = (joy.get_axis(5) + 1) / 2
-                r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
-                master_speed = r2_raw * INITIAL_MAX_SPEED
+                 # MANUAL MODE - L2/R2 Speed + Stick Differential
+                l2_raw = (joy.get_axis(2) + 1) / 2
+                if l2_raw > 0.1:
+                    master_speed = -l2_raw * INITIAL_MAX_SPEED
+                else:
+                    r2_raw = (joy.get_axis(5) + 1) / 2
+                    r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
+                    master_speed = r2_raw * INITIAL_MAX_SPEED
                 
                 stick_x = apply_deadzone(joy.get_axis(0))
                 
@@ -1111,10 +1273,15 @@ def mode_navigation(motors, joystick):
             
             # Execute current mode
             if nav_mode == "MANUAL" and joystick:
-                # Manual control logic
-                r2_raw = (joystick.get_axis(5) + 1) / 2
-                r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
-                master_speed = r2_raw * INITIAL_MAX_SPEED
+
+                # MANUAL MODE - L2/R2 Speed + Stick Differential
+                l2_raw = (joystick.get_axis(2) + 1) / 2
+                if l2_raw > 0.1:
+                    master_speed = -l2_raw * INITIAL_MAX_SPEED
+                else:
+                    r2_raw = (joystick.get_axis(5) + 1) / 2
+                    r2_raw = min(1.0, r2_raw * R2_SENSITIVITY)
+                    master_speed = r2_raw * INITIAL_MAX_SPEED
                 
                 stick_x = apply_deadzone(joystick.get_axis(0))
                 
@@ -1185,18 +1352,22 @@ def main():
         print("SELECT MODE:")
         print("=" * 70)
 
+        print(f"  0. Manual Pulse Test (Bidirectional)")
         print(f"  1. PS4 Advanced (R2 speed + stick differential)")
         print(f"  2. AI Simple Chase")
         print(f"  3. AI Smart Search")
         print(f"  4. Navigation Sequence")
         print(f"  5. Exit")
         
-        choice = input("\nChoice (1-5): ").strip() # strips whitespace and returns characters only
+        choice = input("\nChoice (0-5): ").strip() # strips whitespace and returns characters only
         
-        if choice == "1":
+        if choice == "0":
+            mode_manual_pulse(motors)
+
+        elif choice == "1":
             if not joystick:
                 print(" Need PS4 controller")
-                continue
+                continue    
             mode_ps4_advanced(motors,joystick)
         
         elif choice == "2":
