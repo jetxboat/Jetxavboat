@@ -1,0 +1,104 @@
+clear all;
+map_type = 1;
+qcar_types = 2;
+%% Setting Qcar Variables
+Controller_Sample_Time = 1/500;
+CSI_Sample_Time = Controller_Sample_Time * ceil(0.033 / Controller_Sample_Time);
+RealSense_Sample_Time = Controller_Sample_Time * ceil(0.033 / Controller_Sample_Time);
+ImageDisplay_Sample_Time = Controller_Sample_Time * 50;
+LiDAR_Sample_Time = Controller_Sample_Time * ceil(1/15 / Controller_Sample_Time);
+Audio_Sample_Time = Controller_Sample_Time * 100;
+Initialization_Time = 5;
+cameraStepSize = 3e-2;
+NN_Sample_Time = RealSense_Sample_Time*1;
+SPR_qcar2 = 1000;
+if map_type == 1
+    cal_pos = [0, 2, 0];
+else
+    cal_pos = [0, 0, 0];
+end
+%% Gyro KF
+GyroKF_sampleTime = 0.001;
+GyroKF_X0 = [0;0];
+GyroKF_P0 = eye(2);
+GyroKF_Q = diag([0.01, 0.001]);
+GyroKF_R = 0.01;
+%% QCar EKF
+QCarEKF_sampleTime = GyroKF_sampleTime;
+QCarEKF_L = 0.24;
+QcarKF_X0 = [0; 0; 0];
+QCarEKF_P0 = eye(3);
+QCarEKF_Q = diag([0.00001, 0.00001, 0.00001]);
+QCarEKF_R_heading = diag(0.1);
+QCarEKF_R_combined = diag([0.1, 0.1, 0.01]);
+%% Load Calibration Files
+qcar2_lidar_to_map_rotation = 0;
+load distance_new_qcar2.mat;
+load angles_new_qcar2.mat;
+range_qcar2 = distance_new_qcar2(2: length (distance_new_qcar2), width (distance_new_qcar2)-5);
+angles_qcar2 = angles_new_qcar2(2: length (angles_new_qcar2), width (angles_new_qcar2)-5);
+range_indicies_qcar2 = find(range_qcar2 == 0);
+%% Load and Plot Paths
+load ("SDCS_Paths_7.mat");
+
+%% --- Trial 38: Forced  Loop (Right-Turn Return) ---
+% 1. Create References
+px4_ref = path_x4; py4_ref = path_y4;
+px6_ref = path_x6; py6_ref = path_y6;
+
+% 2. Coordinates
+hub      = [-1.4,-.8];%[-1.125, -0.912];
+pickup   = [ 0.125,  4.395];
+junction = [-1.950,  1.334]; 
+dropoff  = [-1.050,  0.800];
+
+% --- SEGMENT 1 & 2 (Outer Road) ---
+[~, i1_s] = min(hypot(px4_ref - hub(1), py4_ref - hub(2)));
+[~, i1_e] = min(hypot(px4_ref - pickup(1), py4_ref - pickup(2)));
+[~, i2_e] = min(hypot(px4_ref - junction(1), py4_ref - junction(2)));
+idx1 = [i1_s:length(px4_ref), 1:i1_e];
+idx2 = i1_e:i2_e;
+
+% --- SEGMENT 3 (Left Turn to Dropoff) ---
+[~, i3_s] = min(hypot(px6_ref - junction(1), py6_ref - junction(2)));
+[~, i3_e] = min(hypot(px6_ref - dropoff(1), py6_ref - dropoff(2)));
+if i3_s > i3_e, idx3 = i3_s:-1:i3_e; else, idx3 = [i3_s:-1:1, length(px6_ref):-1:i3_e]; end
+
+% --- SEGMENT 4: THE YELLOW PATH FIX ---
+[~, i4_e] = min(hypot(px6_ref - hub(1), py6_ref - hub(2)));
+
+% To follow the yellow line, we MUST move backward through the Path 6 array 
+% from the Dropoff point to loop around the right side.
+if i3_e > i4_e
+    idx4 = i3_e:-1:i4_e; 
+else
+    % Wrap around logic for a reverse loop
+    idx4 = [i3_e:-1:1, length(px6_ref):-1:i4_e];
+end
+
+% --- 3. INTERPOLATION (30,000 pts) ---
+seg1 = [interp1(1:length(idx1), px4_ref(idx1), linspace(1,length(idx1), 3000)).', ...
+        interp1(1:length(idx1), py4_ref(idx1), linspace(1,length(idx1), 3000)).'];
+seg2 = [interp1(1:length(idx2), px4_ref(idx2), linspace(1,length(idx2), 2000)).', ...
+        interp1(1:length(idx2), py4_ref(idx2), linspace(1,length(idx2), 2000)).'];
+seg3 = [interp1(1:length(idx3), px6_ref(idx3), linspace(1,length(idx3), 1000)).', ...
+        interp1(1:length(idx3), py6_ref(idx3), linspace(1,length(idx3), 1000)).'];
+seg4 = [interp1(1:length(idx4), px6_ref(idx4), linspace(1,length(idx4), 4000)).', ...
+        interp1(1:length(idx4), py6_ref(idx4), linspace(1,length(idx4), 4000)).'];
+
+% --- 4. FINAL ASSEMBLY ---
+stop_len = 5000;
+path_x4 = [repmat(hub(1), stop_len, 1); seg1(:,1); repmat(pickup(1), stop_len, 1); ...
+           seg2(:,1); seg3(:,1); repmat(dropoff(1), stop_len, 1); ...
+           seg4(:,1); repmat(hub(1), stop_len, 1)];
+path_y4 = [repmat(hub(2), stop_len, 1); seg1(:,2); repmat(pickup(2), stop_len, 1); ...
+           seg2(:,2); seg3(:,2); repmat(dropoff(2), stop_len, 1); ...
+           seg4(:,2); repmat(hub(2), stop_len, 1)];
+
+% --- 5. PLOT TO VERIFY ---
+figure; hold on; grid on; axis equal;
+plot(px4_ref, py4_ref, '.', 'Color', [0.9 0.9 0.9]);
+plot(px6_ref, py6_ref, '.', 'Color', [0.8 0.8 1.0]);
+plot(path_x4, path_y4, 'b', 'LineWidth', 2); % Should now be the yellow route
+plot(dropoff(1), dropoff(2), 'gs', 'MarkerSize', 12);
+title('Path');
